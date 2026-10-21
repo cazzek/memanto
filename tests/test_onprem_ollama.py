@@ -5,7 +5,7 @@ mock_ollama_setup = Mock()
 sys.modules["moorcheh"] = Mock()
 sys.modules["moorcheh.ollama_setup"] = mock_ollama_setup
 
-from memanto.cli.commands import core
+from memanto.cli.commands import core  # noqa: E402
 
 
 def test_pull_ollama_model_uses_host_http_when_native_ollama_is_reachable(
