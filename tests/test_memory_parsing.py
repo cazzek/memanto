@@ -12,9 +12,8 @@ def make_memory(content: str, memory_type: MemoryType | None = None) -> MemoryRe
         type=memory_type or "fact",
         title="test",
         actor_id="user",
-        source="test",
-        scope_type="agent",
-        scope_id="test",
+        source="system",
+        agent_id="test",
     )
     if memory_type is None:
         cast(Any, memory).type = None
@@ -30,6 +29,54 @@ def test_detect_preference():
     parser.parse_memory(memory)
 
     assert memory.type == "preference"
+
+
+def test_detect_negated_preferences_instead_of_instructions():
+    parser = MemoryParsingService()
+
+    cases = [
+        "I don't like Python",
+        "I really don't like JavaScript",
+        "I do not like dark mode",
+        "We don’t enjoy weekly meetings",
+        "She doesn't prefer email",
+        "I no longer like Vim",
+        "I never liked Vim",
+        "They can't stand noisy notifications",
+        "The client prefers not to receive phone calls",
+        "The client detests email",
+        "The customer loathes the new UI",
+        "My client despises late meetings",
+    ]
+
+    for content in cases:
+        memory = make_memory(content)
+
+        parser.parse_memory(memory)
+
+        assert memory.type == "preference", content
+
+
+def test_negative_imperative_remains_an_instruction():
+    parser = MemoryParsingService()
+
+    cases = [
+        "Avoid using unpinned dependencies in production",
+        "Never deploy on Fridays",
+        "Don't use spaces for indentation",
+    ]
+
+    for content in cases:
+        memory = make_memory(content)
+        parser.parse_memory(memory)
+        assert memory.type == "instruction", content
+    parser = MemoryParsingService()
+
+    memory = make_memory("Don't deploy unpinned dependencies in production")
+
+    parser.parse_memory(memory)
+
+    assert memory.type == "instruction"
 
 
 # 2 Do NOT override existing type
@@ -162,6 +209,76 @@ def test_reminder_intent_beats_artifact_mention():
     assert memory.type == "commitment"
 
 
+def test_desire_framing_beats_topical_error_terms():
+    """A desire about how work is reported is a preference, not an incident."""
+
+    parser = MemoryParsingService()
+
+    cases = [
+        "I want error messages explained in plain English.",
+        "I would like the logs to show the raw payload.",
+        "I'd prefer errors surfaced inline rather than at the end.",
+        "Prefer answers that explain what went wrong before the solution.",
+        "Prefer tables over prose in status updates.",
+        "Please prefer concise summaries over long ones.",
+    ]
+
+    for content in cases:
+        memory = make_memory(content)
+
+        parser.parse_memory(memory)
+
+        assert memory.type == "preference", content
+
+
+def test_presentation_imperative_beats_topical_error_terms():
+    """A sentence opening on a presentation directive is an instruction."""
+
+    parser = MemoryParsingService()
+
+    memory = make_memory("Show the failing case first, then the fix.")
+
+    parser.parse_memory(memory)
+
+    assert memory.type == "instruction"
+
+
+def test_desire_framing_does_not_steal_goals():
+    """A desire followed by "to <verb>" still belongs to the goal ruleset."""
+
+    parser = MemoryParsingService()
+
+    cases = [
+        "I want to achieve 99.9 percent uptime by Q4",
+        "I would like to reduce build time this quarter",
+        "We want to improve conversion by next sprint",
+        "Prefer to ship the CLI by Friday",
+        "Prefer to finish the migration this quarter",
+        "Please prefer to launch the beta next sprint",
+    ]
+
+    for content in cases:
+        memory = make_memory(content)
+
+        parser.parse_memory(memory)
+
+        assert memory.type == "goal", content
+
+
+def test_work_choice_preference_still_loses_to_hard_requirement():
+    """The desire rule stays narrow: a choice about the work is not upgraded."""
+
+    parser = MemoryParsingService()
+
+    memory = make_memory(
+        "I prefer the new approach because we decided it must be implemented before the next client meeting."
+    )
+
+    parser.parse_memory(memory)
+
+    assert memory.type == "instruction"
+
+
 # Fuzzy fallback: typo'd decisive terms the deterministic rules miss
 def test_fuzzy_fallback_rescues_typo_decision():
     parser = MemoryParsingService()
@@ -191,3 +308,23 @@ def test_fuzzy_fallback_does_not_fire_on_unrelated_text():
     parser.parse_memory(memory)
 
     assert memory.type == "fact"
+
+
+def test_ambiguity_guard_and_fuzzy_fallback_interactions():
+    parser = MemoryParsingService()
+
+    cases = {
+        # "is" should no longer bypass the fuzzy fallback for typos
+        "The project uses Django and it is maintained, and we decded on Postgres": "decision",
+        # Strong fact patterns should still classify as fact
+        "The API endpoint is called /v1/search and it was enabled last week": "fact",
+        # Bare auxiliary alone falls back correctly to decision due to fuzzy matching
+        "It is nice and we decded on the new plan": "decision",
+        # High confidence fact patterns are unaffected
+        "The database port is 5432": "fact",
+    }
+
+    for content, expected_type in cases.items():
+        memory = make_memory(content)
+        parser.parse_memory(memory)
+        assert memory.type == expected_type

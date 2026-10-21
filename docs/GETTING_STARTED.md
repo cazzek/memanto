@@ -8,7 +8,7 @@
 
 ## What is MEMANTO?
 
-MEMANTO (Your agents focus. Memanto remembers.) is a production-ready FastAPI service that gives your AI agents persistent memory across conversations, sessions, and workflows.
+MEMANTO (Memory that AI Agents Love!) is a production-ready FastAPI service that gives your AI agents persistent memory across conversations, sessions, and workflows.
 
 **Think of it as**: A PostgreSQL database, but optimized for AI agents - with semantic search, AI-powered summarization, and built specifically for agent workflows.
 
@@ -278,7 +278,14 @@ You'll see all 17 API endpoints with interactive testing!
       "content": "MEMANTO is working",
       "type": "fact",
       "confidence": 1.0,
-      "created_at": "2025-12-28T10:30:00Z"
+      "status": "active",
+      "tags": [],
+      "source": "agent",
+      "source_ref": null,
+      "provenance": "explicit_statement",
+      "score": 0.92,
+      "created_at": "2025-12-28T10:30:00Z",
+      "updated_at": "2025-12-28T10:30:00Z"
     }
   ]
 }
@@ -294,7 +301,32 @@ Now that MEMANTO is running, you need to connect your AI agent to it.
 
 ### Quick Integration Example
 
-**Using the simplified agent API:**
+**Python, same process:** `pip install memanto` includes a client that needs no running server — see the [Python SDK](https://docs.memanto.ai/sdk/python):
+
+```python
+from memanto import Memanto
+
+memanto = Memanto(agent_id="my-agent")
+memanto.remember("User prefers concise answers", type="preference")
+memanto.recall("how should I answer?")
+```
+
+**Go, against the server you deployed:** the [Go SDK](../sdks/go) handles agent creation and sessions. Pass your Moorcheh key as `APIKey` when the server is reachable beyond localhost:
+
+```go
+client, err := memanto.New(memanto.Options{
+	AgentID: "my-agent",
+	BaseURL: "http://localhost:8000",
+	APIKey:  os.Getenv("MOORCHEH_API_KEY"),
+})
+if err != nil {
+	log.Fatal(err)
+}
+client.Remember(ctx, memanto.RememberInput{Content: "User prefers concise answers", Type: "preference"})
+client.Recall(ctx, memanto.RecallInput{Query: "how should I answer?"})
+```
+
+**Over HTTP, using the simplified agent API:**
 
 ```python
 import httpx
@@ -516,8 +548,8 @@ Now that MEMANTO is running, you're ready to build memory-enabled AI agents!
 
 **Recommended reading order:**
 1. ✅ You are here: GETTING_STARTED.md
-2. → [AGENT_INTEGRATION_GUIDE.md](AGENT_INTEGRATION_GUIDE.md) - Complete code examples
-3. → [AGENT_PATTERNS_OVERVIEW.md](AGENT_PATTERNS_OVERVIEW.md) - Choose your pattern
+2. → [AGENT_INTEGRATION_GUIDE.md](AGENT_INTEGRATION_GUIDE.md) — Agent integration patterns
+3. → [SESSION_ARCHITECTURE.md](SESSION_ARCHITECTURE.md) — Session & memory architecture
 4. → [ENHANCEMENTS_SUMMARY.md](ENHANCEMENTS_SUMMARY.md) - Advanced features
 5. → [ARCHITECTURE_ONE_PAGER.md](ARCHITECTURE_ONE_PAGER.md) - System design
 

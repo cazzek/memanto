@@ -10,8 +10,10 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import typer
@@ -19,6 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from memanto.app.clients.backend import Backend
+from memanto.app.config import is_loopback_host, settings
 from memanto.cli.commands._shared import (
     ACCENT,
     BOLD_BRIGHT,
@@ -28,6 +31,7 @@ from memanto.cli.commands._shared import (
     SUCCESS,
     WARNING,
     _error,
+    _warn,
     app,
     config_manager,
     console,
@@ -35,6 +39,29 @@ from memanto.cli.commands._shared import (
     print_logo,
     show_welcome_banner,
 )
+
+
+def _notify_exposed_deployment(host: str) -> None:
+    """Warn when MEMANTO serves plain HTTP on a network-facing address."""
+    if settings.DEBUG or is_loopback_host(host):
+        return
+    _warn(
+        f"Memanto is serving over plain HTTP on {host!r} (no built-in TLS). Any "
+        "network peer that can reach this port can sniff the session cookie "
+        "(full memory read/write for an active agent) and enumerate every API "
+        "route. Bind to a loopback address (127.0.0.1) or terminate TLS in "
+        "front of Memanto."
+    )
+
+
+def _uvicorn_proxy_headers() -> bool:
+    """Leave forwarded headers to Memanto when trusted proxies are configured.
+
+    uvicorn's proxy handling rewrites the client address to the
+    ``X-Forwarded-For`` value before the app runs, so the trusted-proxy check
+    would never see the proxy's own IP.
+    """
+    return not settings.MEMANTO_PROXY_ALLOWED_IPS
 
 
 def _first_run_setup() -> None:
@@ -329,6 +356,34 @@ def _prompt_embedding_provider() -> tuple[str, str, str]:
     return "ollama", "nomic-embed-text", ""
 
 
+def _import_user_config() -> tuple:
+    """Import moorcheh-client's user-config helpers across its layouts.
+
+    moorcheh-client 0.1.5 reorganised the package into ``client`` and ``cli``
+    subpackages, moving ``moorcheh/user_config.py`` to
+    ``moorcheh/cli/user_config.py``. Because the dependency is declared as
+    ``moorcheh-client>=0.1.3`` with no upper bound, a fresh install resolves to
+    0.1.5 and the old import path raises ImportError, which aborted on-prem
+    setup entirely. Try the new location first, then fall back to the old one so
+    0.1.3 through 0.1.5 all work.
+    """
+    try:
+        from moorcheh.cli.user_config import (  # type: ignore[import-not-found,import-untyped]
+            EmbeddingConfig,
+            LlmConfig,
+            default_base_url,
+            save_runtime_config,
+        )
+    except ImportError:
+        from moorcheh.user_config import (  # type: ignore[import-not-found,import-untyped]
+            EmbeddingConfig,
+            LlmConfig,
+            default_base_url,
+            save_runtime_config,
+        )
+    return EmbeddingConfig, LlmConfig, default_base_url, save_runtime_config
+
+
 # Valid on-prem LLM identifiers, sourced from moorcheh.user_config. Listed
 # explicitly so the prompt is stable even if moorcheh-client adds/removes
 # models. Keep in sync with ``moorcheh.user_config.LLM_PROVIDER_MODELS``.
@@ -437,12 +492,12 @@ def _persist_moorcheh_llm_config(
     ``save_runtime_config`` helper so the schema stays in sync.
     """
     try:
-        from moorcheh.user_config import (  # type: ignore[import-not-found]
+        (
             EmbeddingConfig,
             LlmConfig,
             default_base_url,
             save_runtime_config,
-        )
+        ) = _import_user_config()
     except ImportError as e:
         _error(f"moorcheh.user_config unavailable: {e}")
         return
@@ -476,7 +531,10 @@ def _pull_ollama_model(model: str) -> None:
     ``docker exec`` for a bundled container we can't reach over HTTP.
     """
     try:
-        from moorcheh.ollama_setup import ollama_is_reachable, pull_ollama_model_http
+        from moorcheh.ollama_setup import (  # type: ignore[import-untyped]
+            ollama_is_reachable,
+            pull_ollama_model_http,
+        )
     except ImportError:
         ollama_is_reachable = None
 
@@ -599,7 +657,7 @@ def main_callback(
         is_eager=True,
     ),
 ):
-    """MEMANTO CLI - Your agents focus. Memanto remembers."""
+    """MEMANTO CLI - Memory that AI Agents Love!"""
     if ctx.invoked_subcommand is None:
         # Print logo
         print_logo()
@@ -630,7 +688,7 @@ def status():
     console.print(
         Panel.fit(
             f"[{BOLD_PRIMARY}]MEMANTO Status Dashboard[/{BOLD_PRIMARY}]\n"
-            f"Your agents focus. Memanto remembers.  •  v{memanto_version}",
+            f"Memory that AI Agents Love!  •  v{memanto_version}",
             border_style=PRIMARY,
         )
     )
@@ -649,7 +707,6 @@ def status():
 
     # Configuration
     is_configured = config_manager.is_configured()
-    server_cfg = config_manager.get_server_config()
 
     cfg_table = Table(show_header=False, box=None, padding=(0, 2))
     cfg_table.add_column("Key", style="dim")
@@ -675,7 +732,7 @@ def status():
         except Exception:
             cfg_table.add_row("On-Prem Server", "[red]● offline[/red]")
 
-    server_url = f"http://{server_cfg['url']}:{server_cfg['port']}"
+    server_url = config_manager.get_server_url()
     if is_configured:
         cfg_table.add_row("Local REST API URL", server_url)
         if backend == Backend.CLOUD:
@@ -852,7 +909,9 @@ def status():
     # Registered Agents
     try:
         direct = get_client()
-        agents = direct.list_agents()
+        listed = direct.list_agents()
+        # Both clients return {"agents": [...], "count": n, "warnings": [...]}.
+        agents = listed.get("agents", []) if isinstance(listed, dict) else listed
 
         if agents:
             agent_table = Table(
@@ -883,6 +942,29 @@ def status():
     except Exception:
         console.print("[dim]Could not fetch agent list.[/dim]")
 
+    # Check for instruction updates
+    try:
+        from memanto.cli.connect.templates import TEMPLATE_VERSION
+        from memanto.cli.connect.updater import check_for_updates
+
+        status = check_for_updates(project_dir=".")
+
+        is_outdated = status.get("outdated")
+        installed_version = status.get("installed_version")
+
+        if is_outdated:
+            console.print(
+                f"\n[{BOLD_PRIMARY}]Agent Instruction Status[/{BOLD_PRIMARY}]"
+            )
+            console.print(
+                f"[yellow]⚠️ Outdated (v{installed_version} installed, v{TEMPLATE_VERSION} available)[/yellow]"
+            )
+            console.print(
+                "[yellow]   Run `memanto connect update` to apply the latest instruction hardening.[/yellow]"
+            )
+    except Exception as e:
+        console.print(f"[dim]Failed to check instruction update status: {e}[/dim]")
+
     console.print()
 
 
@@ -905,6 +987,8 @@ def serve(
     if host == "localhost":
         host = "0.0.0.0"  # Typically want 0.0.0.0 for bind
     port = port or server_cfg.get("port", 8000)
+
+    _notify_exposed_deployment(host)
 
     console.print(
         Panel.fit(
@@ -955,7 +1039,8 @@ def serve(
     display_host = "localhost" if host == "0.0.0.0" else host
     console.print("\n[green]Starting local REST API...[/green]")
     console.print(f"[dim]Server URL: http://{display_host}:{port}[/dim]")
-    console.print(f"[dim]API Docs: http://{display_host}:{port}/docs[/dim]")
+    if settings.MEMANTO_ENABLE_DOCS:
+        console.print(f"[dim]API Docs: http://{display_host}:{port}/docs[/dim]")
     console.print(f"[dim]Health Check: http://{display_host}:{port}/health[/dim]")
     console.print(
         "\n[bold]Next step:[/bold] Open a new terminal and run [bright_white]memanto agent create <agent-id>[/bright_white]."
@@ -971,6 +1056,7 @@ def serve(
             port=port,
             reload=reload,
             log_level="info",
+            proxy_headers=_uvicorn_proxy_headers(),
         )
     except KeyboardInterrupt:
         console.print("\n\n[yellow]Server stopped.[/yellow]")
@@ -983,13 +1069,43 @@ def serve(
 # ============================================================================
 
 
+def _open_dashboard_window(url: str) -> None:
+    """Open ``url`` safely in the user's default browser.
+
+    Validates that the URL uses an HTTP/HTTPS scheme and avoids shell interpolation
+    to prevent command injection.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        console.print(f"[{WARNING}]Refusing to open non-HTTP(S) URL:[/{WARNING}] {url}")
+        return
+
+    # On Windows, try to open Edge or Chrome in standalone app mode for a native feel.
+    success = False
+    if sys.platform == "win32":
+        for browser in ("msedge", "chrome"):
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", browser, f"--app={url}"],
+                    shell=False,
+                )
+                success = True
+                break
+            except (FileNotFoundError, OSError):
+                continue
+
+    # Fallback to default browser (POSIX / macOS, or Windows when both
+    # Edge and Chrome are missing).
+    if not success:
+        webbrowser.open_new(url)
+
+
 @app.command()
 def ui(
     host: str = typer.Option(None, "--host", help="Server host (defaults to config)"),
     port: int = typer.Option(None, "--port", help="Server port (defaults to config)"),
 ):
     """Start MEMANTO server and open the Web UI Dashboard."""
-    import webbrowser
 
     server_cfg = config_manager.get_server_config()
     host = host or server_cfg.get("url", "0.0.0.0")
@@ -1023,28 +1139,6 @@ def ui(
 
     ui_url = f"http://localhost:{port}/ui"
 
-    def _open_dashboard_window(url: str):
-        import subprocess
-        import sys
-
-        # On Windows, try to open Edge or Chrome in standalone app mode for a native feel
-        success = False
-        if sys.platform == "win32":
-            try:
-                # Need shell=True for `start` command to resolve registry paths
-                subprocess.Popen(f'start msedge --app="{url}"', shell=True)
-                success = True
-            except Exception:
-                try:
-                    subprocess.Popen(f'start chrome --app="{url}"', shell=True)
-                    success = True
-                except Exception:
-                    pass
-
-        # Fallback to default browser
-        if not success:
-            webbrowser.open_new(url)
-
     if port_in_use:
         console.print(f"\n[green]Server already running on port {port}.[/green]")
         console.print(f"[{BRIGHT}]Opening dashboard:[/{BRIGHT}] {ui_url}")
@@ -1059,7 +1153,8 @@ def ui(
         )
     )
     console.print(f"\n[{BRIGHT}]Dashboard:[/{BRIGHT}]  {ui_url}")
-    console.print(f"[dim]API Docs:   http://localhost:{port}/docs[/dim]")
+    if settings.MEMANTO_ENABLE_DOCS:
+        console.print(f"[dim]API Docs:   http://localhost:{port}/docs[/dim]")
     console.print("\n[bold]Press CTRL+C to stop.[/bold]\n")
 
     # Open browser after a short delay (in background thread)
@@ -1070,10 +1165,18 @@ def ui(
     browser_thread = threading.Thread(target=_open_browser, daemon=True)
     browser_thread.start()
 
+    _notify_exposed_deployment(host)
+
     # Start server
     try:
         os.environ["MEMANTO_UI_MODE"] = "true"
-        uvicorn.run("memanto.app.main:app", host=host, port=port, log_level="info")
+        uvicorn.run(
+            "memanto.app.main:app",
+            host=host,
+            port=port,
+            log_level="info",
+            proxy_headers=_uvicorn_proxy_headers(),
+        )
     except KeyboardInterrupt:
         console.print("\n\n[yellow]Dashboard stopped.[/yellow]")
     except Exception as e:

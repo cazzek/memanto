@@ -6,8 +6,10 @@ Replaces tenant_id with Moorcheh API key-based authentication.
 """
 
 import asyncio
+import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from memanto.app.clients import moorcheh as moorcheh_clients
 from memanto.app.config import settings
@@ -23,6 +25,8 @@ from memanto.app.services.agent_service import AgentService
 from memanto.app.utils.errors import (
     AgentAlreadyExistsError,
     AgentNotFoundError,
+    AuthorizationError,
+    NamespaceError,
     SessionNotFoundError,
     map_error_to_http_exception,
 )
@@ -34,9 +38,10 @@ router = APIRouter()
 # Commented to avoid triggering ruff linter
 from memanto.app.routes import memory  # noqa: E402
 from memanto.app.routes.auth_deps import (  # noqa: E402
+    clear_session_cookie,
     get_current_session,
-    get_moorcheh_api_key,
     get_session_service,
+    set_session_cookie,
     verify_moorcheh_api_key,
 )
 
@@ -51,6 +56,65 @@ def get_agent_service():
     return agent_service
 
 
+def _delete_agent_locally(agent_id: str) -> None:
+    """Delete agent metadata and session state under one lifecycle lock."""
+    session_service = get_session_service()
+    with session_service.lock_agent_lifecycle(agent_id):
+        agent_service.delete_agent(agent_id)
+        session_service.delete_session(agent_id)
+
+
+def _revoke_orphaned_session(agent_id: str) -> None:
+    """Delete a session if its activation was cancelled before returning."""
+    session_service = get_session_service()
+    with session_service.lock_agent_lifecycle(agent_id):
+        session_service.delete_session(agent_id)
+
+
+def _activate_agent_locked(agent_id: str, duration_hours: int) -> Session:
+    """Create a session only while its agent still exists under the lock."""
+    session_service = get_session_service()
+    with session_service.lock_agent_lifecycle(agent_id):
+        # Prevent session hijack: reject re-activation while a valid session is
+        # already live. An attacker who knows an agent_id could otherwise call
+        # activate at any time to steal the session and lock out the real holder.
+        # Callers must deactivate the existing session before creating a new one.
+        existing = session_service.get_session(agent_id)
+        if existing and existing.is_active():
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Agent '{agent_id}' already has an active session. "
+                    "Deactivate it first before re-activating."
+                ),
+            )
+
+        agent = agent_service.get_agent(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"Agent '{agent_id}' not found")
+
+        session = session_service.create_session(
+            agent_id=agent_id,
+            pattern=agent.pattern,
+            duration_hours=duration_hours,
+        )
+        agent_service.update_agent_stats(
+            agent_id=agent_id,
+            last_session=session.started_at,
+            increment_session_count=True,
+        )
+        return session
+
+
+_namespace_counts_state: dict[str, Any] = {
+    "data": dict[str, int](),
+    "time": float("-inf"),
+}
+_NAMESPACE_CACHE_TTL = 300.0  # seconds
+
+
 async def _namespace_item_counts(moorcheh_api_key: str) -> dict[str, int]:
     """Map namespace_name -> live document count from Moorcheh.
 
@@ -59,16 +123,37 @@ async def _namespace_item_counts(moorcheh_api_key: str) -> dict[str, int]:
     document count, which is what the UI should display. Best-effort: returns an
     empty map if Moorcheh is unreachable so agent listing still succeeds.
     """
+    now = time.monotonic()
+    if now - _namespace_counts_state["time"] < _NAMESPACE_CACHE_TTL:
+        return _namespace_counts_state["data"]  # type: ignore
+
     try:
         client = moorcheh_clients.get_moorcheh_client()
         ns_resp = await asyncio.to_thread(client.namespaces.list)
-        return {
-            ns["namespace_name"]: ns.get("item_count", 0)
-            for ns in ns_resp.get("namespaces", [])
-            if ns.get("namespace_name")
-        }
+        namespaces = ns_resp.get("namespaces", []) if isinstance(ns_resp, dict) else []
+        if not isinstance(namespaces, list):
+            return {}
+
+        counts: dict[str, int] = {}
+        for ns in namespaces:
+            if not isinstance(ns, dict):
+                continue
+            namespace_name = ns.get("namespace_name")
+            if not isinstance(namespace_name, str) or not namespace_name:
+                continue
+            raw_count = ns.get("item_count", 0)
+            try:
+                counts[namespace_name] = int(raw_count)
+            except (TypeError, ValueError):
+                counts[namespace_name] = 0  # Fallback to 0 if count is invalid
+
+        _namespace_counts_state["data"] = counts
+        _namespace_counts_state["time"] = now
+        return counts
     except Exception:
-        return {}
+        # On failure, extend cache time slightly (60s backoff) to avoid hammering the upstream
+        _namespace_counts_state["time"] = now - _NAMESPACE_CACHE_TTL + 60.0
+        return _namespace_counts_state["data"]  # type: ignore
 
 
 # ============================================================================
@@ -77,8 +162,8 @@ async def _namespace_item_counts(moorcheh_api_key: str) -> dict[str, int]:
 
 
 @router.post("/agents", response_model=AgentInfo, status_code=201)
-async def create_agent(
-    agent_create: AgentCreate, moorcheh_api_key: str = Depends(get_moorcheh_api_key)
+def create_agent(
+    agent_create: AgentCreate, moorcheh_api_key: str = Depends(verify_moorcheh_api_key)
 ):
     """
     Create a new MEMANTO agent
@@ -97,7 +182,13 @@ async def create_agent(
 
 
 @router.get("/agents", response_model=AgentList)
-async def list_agents(moorcheh_api_key: str = Depends(verify_moorcheh_api_key)):
+async def list_agents(
+    include_counts: bool = Query(
+        True,
+        description="Whether to fetch live memory counts from Moorcheh (slow for many namespaces)",
+    ),
+    moorcheh_api_key: str = Depends(verify_moorcheh_api_key),
+):
     """
     List all agents for this Moorcheh account
 
@@ -106,16 +197,23 @@ async def list_agents(moorcheh_api_key: str = Depends(verify_moorcheh_api_key)):
     namespace rather than the stale value in local metadata.
     """
     agent_list = agent_service.list_agents()
-    counts = await _namespace_item_counts(moorcheh_api_key)
-    for agent in agent_list.agents:
-        if agent.namespace in counts:
-            agent.memory_count = counts[agent.namespace]
+
+    if include_counts:
+        counts = await _namespace_item_counts(moorcheh_api_key)
+        for agent in agent_list.agents:
+            if agent.namespace in counts:
+                agent.memory_count = counts[agent.namespace]
+
     return agent_list
 
 
 @router.get("/agents/{agent_id}", response_model=AgentInfo)
 async def get_agent(
-    agent_id: str, moorcheh_api_key: str = Depends(verify_moorcheh_api_key)
+    agent_id: str,
+    include_counts: bool = Query(
+        True, description="Whether to fetch live memory counts from Moorcheh"
+    ),
+    moorcheh_api_key: str = Depends(verify_moorcheh_api_key),
 ):
     """
     Get agent information
@@ -128,14 +226,25 @@ async def get_agent(
         raise map_error_to_http_exception(
             AgentNotFoundError(f"Agent '{agent_id}' not found")
         )
-    counts = await _namespace_item_counts(moorcheh_api_key)
-    if agent.namespace in counts:
-        agent.memory_count = counts[agent.namespace]
+
+    if include_counts and agent.namespace:
+        try:
+            client = moorcheh_clients.get_moorcheh_client()
+            ns_info = await asyncio.to_thread(client.namespaces.get, agent.namespace)
+            if isinstance(ns_info, dict):
+                raw_count = ns_info.get("item_count", 0)
+                try:
+                    agent.memory_count = int(raw_count)
+                except (TypeError, ValueError):
+                    pass  # Ignore invalid counts
+        except Exception:
+            pass  # Best effort, just like list_agents
+
     return agent
 
 
 @router.delete("/agents/{agent_id}", status_code=200)
-async def delete_agent(
+def delete_agent(
     agent_id: str,
     delete_backup_too: bool = Query(
         False, alias="delete-backup-too", description="Delete Moorcheh namespace backup"
@@ -146,7 +255,9 @@ async def delete_agent(
     Delete agent
 
     Always deletes local agent metadata.
-    If `delete-backup-too=true`, also deletes the agent memory namespace in Moorcheh.
+    If `delete-backup-too=true`, also permanently deletes the agent memory
+    namespace in Moorcheh. If that fails, nothing is deleted and the error is
+    returned, so the request can be retried.
     """
     try:
         agent = agent_service.get_agent(agent_id)
@@ -157,15 +268,9 @@ async def delete_agent(
 
         if delete_backup_too:
             # Delete remote namespace only when explicitly requested.
-            moorcheh_client = moorcheh_clients.get_moorcheh_client()
-            try:
-                moorcheh_client.namespaces.delete(namespace_name=agent.namespace)
-            except Exception:
-                # If namespace is already gone/unreachable, keep best-effort behavior
-                # and continue removing local metadata.
-                pass
+            agent_service.delete_agent_memories(agent_id, moorcheh_api_key)
 
-        agent_service.delete_agent(agent_id)
+        _delete_agent_locally(agent_id)
         return {
             "message": (
                 f"Agent '{agent_id}' successfully deleted"
@@ -176,7 +281,7 @@ async def delete_agent(
                 )
             )
         }
-    except AgentNotFoundError as e:
+    except (AgentNotFoundError, NamespaceError) as e:
         raise map_error_to_http_exception(e)
 
 
@@ -188,6 +293,8 @@ async def delete_agent(
 @router.post("/agents/{agent_id}/activate", response_model=Session)
 async def activate_agent(
     agent_id: str,
+    request: Request,
+    response: Response,
     moorcheh_api_key: str = Depends(verify_moorcheh_api_key),
 ):
     """
@@ -200,32 +307,33 @@ async def activate_agent(
 
     Returns session token for use in memory operations.
     """
-    # Check if agent exists
-    agent = agent_service.get_agent(agent_id)
-    if not agent:
-        raise map_error_to_http_exception(
-            AgentNotFoundError(f"Agent '{agent_id}' not found")
-        )
-
     # Session duration is controlled by server defaults.
     duration_hours = settings.SESSION_DEFAULT_DURATION_HOURS
 
+    task = asyncio.create_task(
+        asyncio.to_thread(_activate_agent_locked, agent_id, duration_hours)
+    )
+
     try:
-        session = get_session_service().create_session(
-            agent_id=agent_id,
-            pattern=agent.pattern,
-            duration_hours=duration_hours,
-        )
-
-        # Update agent stats
-        agent_service.update_agent_stats(
-            agent_id=agent_id,
-            last_session=session.started_at,
-            increment_session_count=True,
-        )
-
+        session = await task
+        set_session_cookie(response, session.session_token, request)
         return session
+    except asyncio.CancelledError:
 
+        async def _cleanup_cancelled_activation():
+            try:
+                session = await task
+                if session:
+                    await asyncio.to_thread(_revoke_orphaned_session, agent_id)
+            except Exception:
+                # If the underlying task failed rather than returning a session,
+                # or if the revocation itself fails, there is nothing more to do.
+                # Suppress the error so it doesn't crash the background event loop.
+                pass
+
+        # Ensure cleanup runs even if the parent request is gone
+        asyncio.shield(asyncio.create_task(_cleanup_cancelled_activation()))
+        raise
     except Exception as e:
         raise map_error_to_http_exception(e)
 
@@ -233,6 +341,7 @@ async def activate_agent(
 @router.post("/agents/{agent_id}/deactivate", response_model=SessionSummary)
 async def deactivate_agent(
     agent_id: str,
+    response: Response,
     session: Session = Depends(get_current_session),
     _server_api_key: str = Depends(verify_moorcheh_api_key),
 ):
@@ -244,24 +353,28 @@ async def deactivate_agent(
     """
     if session.agent_id != agent_id:
         raise map_error_to_http_exception(
-            Exception(
+            AuthorizationError(
                 f"Session is for agent '{session.agent_id}', cannot access '{agent_id}'"
             )
         )
 
     try:
         summary = get_session_service().end_session(agent_id)
+        clear_session_cookie(response)
         return summary
     except SessionNotFoundError as e:
         raise map_error_to_http_exception(e)
 
 
 @router.get("/status", response_model=SessionInfo)
-async def get_status():
+async def get_status(
+    _moorcheh_api_key: str = Depends(verify_moorcheh_api_key),
+):
     """
     Get current active session status.
 
-    No parameters required — reads the active session from local state.
+    Requires management credential or loopback origin (same as other
+    agent-lifecycle endpoints). Reads the active session from local state.
     """
     session = get_session_service().get_active_session()
     if session is None:

@@ -2,10 +2,12 @@
 Input Validation and Cost Guards for MEMANTO
 """
 
+import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class InputLimits:
@@ -111,11 +113,13 @@ class ValidatedMemoryWriteRequest(BaseModel):
     text: str = Field(..., description="Memory text content")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @validator("text")
+    @field_validator("text")
+    @classmethod
     def validate_text(cls, v):
         return CostGuard.validate_text_length(v, "text")
 
-    @validator("metadata")
+    @field_validator("metadata")
+    @classmethod
     def validate_metadata(cls, v):
         return CostGuard.validate_metadata_size(v)
 
@@ -126,11 +130,13 @@ class ValidatedMemoryReadRequest(BaseModel):
     query: str = Field(..., description="Search query")
     k: int = Field(default=10, ge=1, description="Number of results")
 
-    @validator("query")
+    @field_validator("query")
+    @classmethod
     def validate_query(cls, v):
         return CostGuard.validate_query_length(v)
 
-    @validator("k")
+    @field_validator("k")
+    @classmethod
     def validate_k(cls, v):
         return CostGuard.validate_k_limit(v)
 
@@ -140,7 +146,8 @@ class ValidatedMemoryAnswerRequest(BaseModel):
 
     question: str = Field(..., description="Question to answer")
 
-    @validator("question")
+    @field_validator("question")
+    @classmethod
     def validate_question(cls, v):
         return CostGuard.validate_query_length(v)
 
@@ -158,4 +165,133 @@ def validate_request_size(
                 "actual_size": len(request_body),
                 "max_size": max_size,
             },
+        )
+
+
+def validate_safe_id(value: str, field_name: str = "id") -> str:
+    """
+    Reject agent_id / session_id values that would escape the storage directory.
+
+    Path traversal via f-strings such as
+        sessions_dir / f"{agent_id}.json"
+    allows a caller to write files outside the intended directory when
+    agent_id contains '..' or OS-level path separators.
+
+    Only alphanumeric characters, hyphens, and underscores are allowed.
+    """
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    # fullmatch (not match+$) so a trailing newline can't sneak through: `$`
+    # matches before a final "\n" even without re.MULTILINE.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError(
+            f"{field_name} '{value}' contains invalid characters. "
+            "Only letters, digits, hyphens, and underscores are allowed."
+        )
+    return value
+
+
+def validate_output_path(
+    output_path: str | None, base_dir: Path | None = None
+) -> Path | None:
+    """Restrict *output_path* to a safe base directory to prevent path traversal writes.
+
+    An authenticated caller who supplies ``output_path="/etc/cron.d/evil"`` could
+    overwrite arbitrary files on the server.  This guard resolves the requested path
+    and ensures it remains inside *base_dir* (defaults to the configured data dir).
+
+    Args:
+        output_path: Raw path string from the API request, or ``None``.
+        base_dir: Allowed parent directory. Defaults to ``get_data_dir()``.
+
+    Returns:
+        Resolved ``Path`` when *output_path* is provided, ``None`` otherwise.
+
+    Raises:
+        HTTPException(400): When the resolved path escapes *base_dir*, attempts
+            to overwrite the base directory itself, or targets sensitive internal
+            storage directories/files.
+    """
+    if output_path is None:
+        return None
+
+    try:
+        from memanto.app.config import get_data_dir
+
+        default_base = get_data_dir()
+    except Exception:
+        default_base = Path.home() / ".memanto"
+
+    safe_base = (base_dir or default_base).resolve()
+    try:
+        candidate = Path(output_path)
+        if not candidate.is_absolute():
+            candidate = safe_base / candidate
+        resolved = candidate.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid output_path")
+
+    try:
+        rel_path = resolved.relative_to(safe_base)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "output_path must be inside the agent data directory. "
+                "Absolute paths that escape it are not allowed."
+            ),
+        )
+
+    # Prevent targeting the root storage directory itself (e.g. output_path="." or empty)
+    if resolved == safe_base:
+        raise HTTPException(
+            status_code=400,
+            detail="output_path cannot be the root storage directory itself.",
+        )
+
+    # Protect internal application metadata when safe_base is the root data directory
+    # (e.g. agents/, sessions/, secret_key, config.json, .env)
+    RESERVED_ROOT_TARGETS = {
+        "agents",
+        "sessions",
+        "tokens",
+        "config.json",
+        "secret_key",
+        ".env",
+    }
+    rel_parts = rel_path.parts
+    if rel_parts and rel_parts[0].lower() in RESERVED_ROOT_TARGETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"output_path cannot target reserved internal path '{rel_parts[0]}'.",
+        )
+
+    return resolved
+
+
+_SUCCESSFUL_WRITE_STATUSES = {"queued", "success", "ok"}
+
+
+def is_successful_write_result(item: object) -> bool:
+    """Check if a Moorcheh API response represents a successful write."""
+    return (
+        isinstance(item, dict)
+        and str(item.get("status", "")).lower() in _SUCCESSFUL_WRITE_STATUSES
+    )
+
+
+def validate_recall_limit(limit: int) -> None:
+    """Reject recall/temporal-recall limits outside [1, InputLimits.MAX_K].
+
+    Shared by DirectClient, SdkClient, and ConfigManager.set_recall_config so
+    the same bound is enforced everywhere a caller-supplied recall limit is
+    accepted, rather than each keeping its own copy of the check.
+    """
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= InputLimits.MAX_K
+    ):
+        raise ValueError(
+            f"Limit must be an integer between 1 and {InputLimits.MAX_K}, got {limit}"
         )

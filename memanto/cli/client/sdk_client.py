@@ -6,11 +6,19 @@ Uses the official moorcheh_sdk to interact with Moorcheh API.
 
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
+if TYPE_CHECKING:
+    from memanto.app.services.memory_policy_service import MemoryPolicyService
+
+from memanto.app.config import get_data_dir
+from memanto.app.constants import (
+    ALLOWED_UPDATE_FIELDS as _ALLOWED_UPDATE_FIELDS,
+)
 from memanto.app.constants import (
     VALID_MEMORY_TYPES as _VALID_MEMORY_TYPES,
 )
@@ -22,18 +30,29 @@ from memanto.app.constants import (
 )
 from memanto.app.constants import (
     MemoryType,
+    SourceType,
 )
 from memanto.app.constants import (
     ProvenanceType as MemoryProvenance,
 )
+from memanto.app.services.activity_service import log_memory_activity
+from memanto.app.utils.atomic_write import atomic_write_text
+from memanto.app.utils.client_identity import set_memanto_session
 from memanto.app.utils.errors import (
     AgentNotFoundError,
     InvalidSessionTokenError,
+    MemoryOperationError,
     SessionError,
     SessionExpiredError,
     SessionNotFoundError,
 )
-from memanto.app.utils.validation import InputLimits
+from memanto.app.utils.temporal_helpers import utc_date_str
+from memanto.app.utils.validation import (
+    InputLimits,
+    is_successful_write_result,
+    validate_recall_limit,
+    validate_safe_id,
+)
 from memanto.cli.config.manager import ConfigManager
 
 logger = logging.getLogger(__name__)
@@ -105,10 +124,10 @@ class SdkClient:
         either way.
         """
         if self._moorcheh is None:
-            from memanto.app.clients.moorcheh import get_moorcheh_client
+            from memanto.app.clients.moorcheh import moorcheh_client
 
             logger.debug("Initializing Moorcheh client via backend dispatcher")
-            self._moorcheh = get_moorcheh_client()
+            self._moorcheh = moorcheh_client.get_client(api_key=self.api_key)
         return self._moorcheh
 
     def _get_write_service(self):
@@ -132,7 +151,7 @@ class SdkClient:
         if self._agent_service is None:
             from memanto.app.services.agent_service import AgentService
 
-            self._agent_service = AgentService()
+            self._agent_service = AgentService(client=self._get_moorcheh())
         return self._agent_service
 
     def _get_session_service(self):
@@ -150,7 +169,9 @@ class SdkClient:
                 DailyAnalysisService,
             )
 
-            self._daily_analysis_service = DailyAnalysisService()
+            self._daily_analysis_service = DailyAnalysisService(
+                client=self._get_moorcheh()
+            )
         return self._daily_analysis_service
 
     def _get_export_service(self):
@@ -164,13 +185,47 @@ class SdkClient:
     # Internal helpers
 
     def _get_validated_session_for_agent(self, agent_id: str):
+        """Return the active session for *agent_id*, and bind it for activity logging.
+
+        Every memory operation passes through here, which makes it the one
+        place that reliably knows both the agent and its live session id - the
+        memory services below only ever receive an agent_id.
+        """
+        session = self._resolve_validated_session(agent_id)
+        set_memanto_session(session.session_id)
+        return session
+
+    def _resolve_validated_session(self, agent_id: str):
         """
         Return the active session for *agent_id*, validating it like the FastAPI
         dependency ``get_current_session``.
         """
-        # Cache hit: avoid redundant disk I/O and JWT decodes in the same request
-        if self._cached_session and self.agent_id == agent_id:
-            return self._cached_session
+        # Cache hit: avoid redundant JWT decodes while the session remains
+        # active. Still runs the same near-expiry auto-renew check as the
+        # cold path below, so long-lived clients keep renewing instead of
+        # eventually hitting SessionExpiredError.
+        if self._cached_session:
+            if self.agent_id == agent_id and self._cached_session.agent_id == agent_id:
+                if not self._cached_session.is_active():
+                    self._cached_session = None
+                    raise SessionExpiredError(
+                        f"Cached session for agent {agent_id} is no longer active"
+                    )
+                session_service = self._get_session_service()
+                renewed = session_service.check_and_auto_renew(agent_id=agent_id)
+                if renewed:
+                    self._cached_session = renewed
+                    self.session_token = renewed.session_token
+                else:
+                    try:
+                        self._cached_session = session_service.validate_session(
+                            self.session_token
+                        )
+                    except Exception:
+                        self._cached_session = None
+                        raise
+                return self._cached_session
+            self._cached_session = None
 
         if not self.session_token or not self.agent_id:
             raise SessionError(
@@ -190,7 +245,17 @@ class SdkClient:
         try:
             # Validate JWT token
             token_payload = session_service.validate_session(self.session_token)
-        except (SessionExpiredError, InvalidSessionTokenError):
+        except SessionExpiredError:
+            # The stored session fully lapsed (e.g. the process was idle past
+            # its expiry). With auto-recreate enabled, transparently issue a
+            # fresh session on this first operation instead of failing.
+            recreated = session_service.check_and_auto_recreate(self.session_token)
+            if recreated is None:
+                raise
+            self._cached_session = recreated
+            self.session_token = recreated.session_token
+            return recreated
+        except InvalidSessionTokenError:
             # Surface the same specific session errors as the service
             raise
 
@@ -239,6 +304,12 @@ class SdkClient:
             ValueError: If *pattern* is invalid.
             AgentAlreadyExistsError: If agent already exists.
         """
+        if not agent_id:
+            raise ValueError("agent_id must not be empty")
+        if not re.fullmatch(r"^[a-zA-Z0-9_-]+$", agent_id):
+            raise ValueError(
+                f"Invalid agent_id: '{agent_id}'. Only alphanumeric characters, hyphens, and underscores are allowed."
+            )
         if pattern not in _VALID_PATTERNS:
             raise ValueError(
                 f"Invalid pattern '{pattern}'. Must be one of: {', '.join(sorted(_VALID_PATTERNS))}"
@@ -256,15 +327,15 @@ class SdkClient:
         agent_info = self._get_agent_service().create_agent(agent_create, self.api_key)
         return cast(dict[str, Any], agent_info.model_dump(mode="json"))
 
-    def list_agents(self) -> list[dict[str, Any]]:
+    def list_agents(self) -> dict[str, Any]:
         """
         List all registered agents.
 
         Returns:
-            List of agent info dicts.
+            Dictionary with 'agents', 'count', and 'warnings'.
         """
         agent_list = self._get_agent_service().list_agents()
-        return [a.model_dump(mode="json") for a in agent_list.agents]
+        return cast(dict[str, Any], agent_list.model_dump(mode="json"))
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         """
@@ -284,19 +355,46 @@ class SdkClient:
             raise AgentNotFoundError(f"Agent '{agent_id}' not found")
         return cast(dict[str, Any], agent.model_dump(mode="json"))
 
-    def delete_agent(self, agent_id: str) -> dict[str, Any]:
+    def delete_agent(
+        self, agent_id: str, delete_memories: bool = False
+    ) -> dict[str, Any]:
         """
         Delete an agent.
 
         Args:
             agent_id: Agent identifier.
+            delete_memories: Also permanently delete the agent's memories in
+                Moorcheh (its namespace). By default they are kept and come
+                back if an agent with the same id is created again.
 
         Returns:
-            Confirmation dict with ``status`` and ``agent_id``.
+            Confirmation dict with ``status``, ``agent_id`` and
+            ``memories_deleted``.
+
+        Raises:
+            AgentNotFoundError: If the agent does not exist.
+            NamespaceError: If deleting the memories fails; the agent is then
+                left intact so the delete can be retried.
         """
         logger.debug("Deleting agent '%s'", agent_id)
-        self._get_agent_service().delete_agent(agent_id)
-        return {"status": "deleted", "agent_id": agent_id}
+        session_service = self._get_session_service()
+        with session_service.lock_agent_lifecycle(agent_id):
+            agent_service = self._get_agent_service()
+            if not agent_service.get_agent(agent_id):
+                raise AgentNotFoundError(f"Agent '{agent_id}' not found")
+            if delete_memories:
+                agent_service.delete_agent_memories(agent_id, self.api_key)
+            agent_service.delete_agent(agent_id)
+            session_service.delete_session(agent_id)
+        if self.agent_id == agent_id:
+            self.session_token = None
+            self.agent_id = None
+            self._cached_session = None
+        return {
+            "status": "deleted",
+            "agent_id": agent_id,
+            "memories_deleted": delete_memories,
+        }
 
     # Session Management
 
@@ -317,25 +415,28 @@ class SdkClient:
         Raises:
             AgentNotFoundError: If agent does not exist.
         """
-        agent = self._get_agent_service().get_agent(agent_id)
-        if not agent:
-            raise AgentNotFoundError(f"Agent '{agent_id}' not found")
+        session_service = self._get_session_service()
+        with session_service.lock_agent_lifecycle(agent_id):
+            agent = self._get_agent_service().get_agent(agent_id)
+            if not agent:
+                raise AgentNotFoundError(f"Agent '{agent_id}' not found")
 
-        logger.debug("Activating agent '%s' for %s hours", agent_id, duration_hours)
-        session = self._get_session_service().create_session(
-            agent_id=agent_id,
-            pattern=agent.pattern,
-            duration_hours=duration_hours,
-        )
+            logger.debug("Activating agent '%s' for %s hours", agent_id, duration_hours)
+            session = session_service.create_session(
+                agent_id=agent_id,
+                pattern=agent.pattern,
+                duration_hours=duration_hours,
+            )
 
-        self._get_agent_service().update_agent_stats(
-            agent_id,
-            last_session=session.started_at,
-            increment_session_count=True,
-        )
+            self._get_agent_service().update_agent_stats(
+                agent_id,
+                last_session=session.started_at,
+                increment_session_count=True,
+            )
 
         self.session_token = session.session_token
         self.agent_id = agent_id
+        self._cached_session = session
 
         return {
             "session_token": session.session_token,
@@ -359,6 +460,7 @@ class SdkClient:
         summary = self._get_session_service().end_session(agent_id)
         self.session_token = None
         self.agent_id = None
+        self._cached_session = None
         return cast(dict[str, Any], summary.model_dump(mode="json"))
 
     def get_session_info(self) -> dict[str, Any]:
@@ -401,7 +503,7 @@ class SdkClient:
         content: str,
         confidence: float = 0.8,
         tags: list[str] | None = None,
-        source: str = "user",
+        source: SourceType = "user",
         provenance: str | None = None,
     ) -> dict[str, Any]:
         """
@@ -430,7 +532,6 @@ class SdkClient:
         """
         # Ensure there is a valid, non-expired session for this agent
         session = self._get_validated_session_for_agent(agent_id)
-        _ = session
 
         self._validate_memory_input(memory_type, title, content, confidence)
 
@@ -451,8 +552,7 @@ class SdkClient:
             type=resolved_memory_type,
             title=title,
             content=content,
-            scope_type="agent",
-            scope_id=agent_id,
+            agent_id=agent_id,
             actor_id=agent_id,
             confidence=confidence,
             tags=tags or [],
@@ -463,12 +563,11 @@ class SdkClient:
         logger.debug("Storing memory for agent '%s' (type=%s)", agent_id, memory_type)
         result = self._get_write_service().store_memory(memory)
 
-        # Log to local session Markdown summary
-        if self.session_token:
-            session_id = "unknown"
-            self._get_session_service().log_memory_to_session_summary(
+        # Log to local session Markdown summary only after a durable write.
+        if self.session_token and is_successful_write_result(result):
+            self._get_session_service().try_log_memory_to_session_summary(
                 agent_id=agent_id,
-                session_id=session_id,
+                session_id=session.session_id,
                 memory_record=memory,
                 memory_id=result.get("id"),
             )
@@ -500,7 +599,7 @@ class SdkClient:
             ValueError: If batch is empty or exceeds 100 items.
         """
         # Ensure there is a valid, non-expired session for this agent
-        self._get_validated_session_for_agent(agent_id)
+        session = self._get_validated_session_for_agent(agent_id)
 
         if not memories:
             raise ValueError("Batch must contain at least one memory")
@@ -514,7 +613,7 @@ class SdkClient:
         memory_records = []
         for i, item in enumerate(memories):
             raw_content = item.get("content", "")
-            if not raw_content:
+            if not isinstance(raw_content, str) or not raw_content.strip():
                 raise ValueError(f"Memory at index {i} has no content")
 
             raw_title = item.get("title")
@@ -538,18 +637,27 @@ class SdkClient:
                 "type": raw_type,
                 "title": title,
                 "content": raw_content,
-                "scope_type": "agent",
-                "scope_id": agent_id,
+                "agent_id": agent_id,
                 "actor_id": agent_id,
                 "confidence": item.get("confidence", 0.8),
                 "tags": item.get("tags", []),
                 "source": item.get("source") or "user",
                 "provenance": provenance,
             }
-            for opt_key in ("source_ref", "created_at", "updated_at"):
+            for opt_key in (
+                "source_ref",
+                "created_at",
+                "updated_at",
+                "status",
+                "expired_at",
+                "expired_by",
+            ):
                 val = item.get(opt_key)
                 if val is not None:
                     kwargs[opt_key] = val
+
+            if kwargs.get("status") == "expired" and (not kwargs.get("expired_at") or not kwargs.get("expired_by")):
+                raise ValueError(f"Memory at index {i} is marked expired but missing expired_at/expired_by")
 
             memory = MemoryRecord(**kwargs)
             memory_records.append(memory)
@@ -566,15 +674,44 @@ class SdkClient:
 
         # Log each memory to local session Markdown summary
         if self.session_token:
-            session_id = "unknown"
+            session_id = session.session_id
             session_svc = self._get_session_service()
 
             # Extract per-memory IDs from the batch result
-            batch_results = result.get("results", [])
+            if not isinstance(result, dict):
+                raise MemoryOperationError(
+                    message="Data corruption detected: Received malformed batch result from storage layer.",
+                    details={"item_preview": str(result)[:100]},
+                )
+
+            if "results" not in result:
+                raise MemoryOperationError(
+                    message="Data corruption detected: Missing 'results' in batch response from storage layer.",
+                    details={"item_preview": str(result)[:100]},
+                )
+
+            batch_results = result["results"]
+            if not isinstance(batch_results, list) or len(batch_results) != len(
+                memory_records
+            ):
+                raise MemoryOperationError(
+                    message="Data corruption detected: Received malformed batch result array from storage layer.",
+                    details={"item_preview": str(batch_results)[:100]},
+                )
 
             for i, mem in enumerate(memory_records):
-                mem_id = batch_results[i].get("id") if i < len(batch_results) else None
-                session_svc.log_memory_to_session_summary(
+                item_result = batch_results[i]
+                if not isinstance(item_result, dict) or not item_result:
+                    raise MemoryOperationError(
+                        message="Data corruption detected: Received malformed batch result from storage layer.",
+                        details={"item_preview": str(item_result)[:100]},
+                    )
+                if not is_successful_write_result(item_result):
+                    continue
+                mem_id = (
+                    item_result.get("id") if isinstance(item_result, dict) else None
+                )
+                session_svc.try_log_memory_to_session_summary(
                     agent_id=agent_id,
                     session_id=session_id,
                     memory_record=mem,
@@ -582,6 +719,82 @@ class SdkClient:
                 )
 
         return result
+
+    def update_memory(
+        self, agent_id: str, memory_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Update a single memory in the active agent namespace.
+
+        Args:
+            agent_id: Target agent.
+            memory_id: Memory document ID to update.
+            updates: Fields to update.
+
+        Returns:
+            Dict with update result metadata.
+
+        Raises:
+            ValueError: If no update fields are provided, or if the payload
+                contains unknown fields, blank content, an out-of-range
+                confidence, or an unsupported memory type.
+        """
+        session = self._get_validated_session_for_agent(agent_id)
+        if not updates:
+            raise ValueError("Provide at least one field to update")
+
+        # Mirror the API-route and DirectClient validation so SDK callers
+        # cannot bypass field-level checks. CodeRabbit review
+        # 2026-06-14T14:03:20Z flagged that this path forwarded `updates`
+        # directly after only an empty-payload check.
+        unknown_fields = set(updates) - _ALLOWED_UPDATE_FIELDS
+        if unknown_fields:
+            raise ValueError(
+                f"Unknown update field(s): {sorted(unknown_fields)}. "
+                f"Allowed: {sorted(_ALLOWED_UPDATE_FIELDS)}"
+            )
+        if "content" in updates:
+            content = updates["content"]
+            if content is None or not str(content).strip():
+                raise ValueError("Memory content must be a non-empty string")
+            if len(str(content)) > _MAX_CONTENT_LENGTH:
+                raise ValueError(
+                    f"Memory content exceeds {_MAX_CONTENT_LENGTH} characters"
+                )
+        if "title" in updates and updates["title"] is not None:
+            if len(str(updates["title"])) > _MAX_TITLE_LENGTH:
+                raise ValueError(f"Memory title exceeds {_MAX_TITLE_LENGTH} characters")
+        if "type" in updates and updates["type"] not in _VALID_MEMORY_TYPES:
+            raise ValueError(
+                f"Invalid memory_type '{updates['type']}'. "
+                f"Must be one of: {', '.join(sorted(_VALID_MEMORY_TYPES))}"
+            )
+        if "confidence" in updates:
+            try:
+                confidence_value = float(updates["confidence"])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Confidence must be a number between 0.0 and 1.0, got {updates['confidence']!r}"
+                )
+            if not 0.0 <= confidence_value <= 1.0:
+                raise ValueError(
+                    f"Confidence must be between 0.0 and 1.0, got {confidence_value}"
+                )
+            # Normalize to float for downstream write service consistency.
+            updates["confidence"] = confidence_value
+
+        result = self._get_write_service().update_memory(
+            memory_id, session.namespace, updates
+        )
+
+        return {
+            "agent_id": agent_id,
+            "namespace": session.namespace,
+            "memory_id": memory_id,
+            "status": result.get("status", "updated"),
+            "action": result.get("action", "updated"),
+            "updated_fields": result.get("updated_fields", list(updates.keys())),
+        }
 
     def extract_memories_from_conversation(
         self,
@@ -609,6 +822,7 @@ class SdkClient:
 
         from memanto.app.services.conversation_memory_extraction_service import (
             ConversationMemoryExtractionService,
+            NothingToExtractError,
         )
 
         service = ConversationMemoryExtractionService(self._get_moorcheh())
@@ -625,6 +839,11 @@ class SdkClient:
                 "candidates": candidates,
                 "count": len(candidates),
             }
+
+        if not candidates:
+            raise NothingToExtractError(
+                "Memory extraction produced no usable candidates"
+            )
 
         result = self.batch_remember(agent_id=agent_id, memories=candidates)
         return {
@@ -665,7 +884,7 @@ class SdkClient:
 
         # Log deletion to local session Markdown summary
         if self.session_token:
-            self._get_session_service().log_memory_deletion_to_session_summary(
+            self._get_session_service().try_log_memory_deletion_to_session_summary(
                 agent_id=agent_id,
                 session_id=session.session_id,
                 memory_id=memory_id,
@@ -677,6 +896,139 @@ class SdkClient:
             "memory_id": memory_id,
             "namespace": namespace,
         }
+
+    # Memory lifecycle
+
+    def expire_memory(
+        self, agent_id: str, memory_id: str, reason: str = "manual"
+    ) -> dict[str, Any]:
+        """
+        Expire one memory without deleting it.
+
+        The memory keeps its content and stays recallable; it is stamped
+        ``expired`` with the time and reason. Reversible via
+        :meth:`restore_memory`.
+
+        Args:
+            agent_id: Target agent.
+            memory_id: Memory to expire.
+            reason: Stamped as ``expired_by`` (default ``manual``).
+
+        Returns:
+            Dict with ``status``, ``expired_at``, and ``expired_by``.
+        """
+        session = self._get_validated_session_for_agent(agent_id)
+        result = self._get_write_service().set_lifecycle(
+            memory_id, session.namespace, expired=True, reason=reason
+        )
+        return {
+            "status": "expired",
+            "agent_id": agent_id,
+            "memory_id": memory_id,
+            "expired_at": result.get("expired_at"),
+            "expired_by": result.get("expired_by"),
+        }
+
+    def restore_memory(self, agent_id: str, memory_id: str) -> dict[str, Any]:
+        """
+        Return an expired memory to the active state, clearing its stamp.
+
+        Args:
+            agent_id: Target agent.
+            memory_id: Memory to restore.
+
+        Returns:
+            Dict with ``status`` set to ``active``.
+        """
+        session = self._get_validated_session_for_agent(agent_id)
+        self._get_write_service().set_lifecycle(
+            memory_id, session.namespace, expired=False
+        )
+        return {
+            "status": "active",
+            "agent_id": agent_id,
+            "memory_id": memory_id,
+        }
+
+    # Expiry policies
+
+    def _get_policy_service(self) -> "MemoryPolicyService":
+        """Build a policy service bound to this client's Moorcheh client."""
+        from memanto.app.services.memory_policy_service import MemoryPolicyService
+
+        return MemoryPolicyService(self._get_moorcheh())
+
+    def get_policy(self, agent_id: str) -> dict[str, Any]:
+        """Return the agent's expiry policy as a plain dict."""
+        self._get_validated_session_for_agent(agent_id)
+        policy = self._get_policy_service().load_policy(agent_id)
+        return {
+            "agent_id": agent_id,
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+            "is_empty": policy.is_empty(),
+        }
+
+    def set_policy(self, agent_id: str, policy: dict[str, Any]) -> dict[str, Any]:
+        """Replace the agent's expiry policy.
+
+        Saving does not expire anything; run :meth:`apply_policy` afterwards.
+        """
+        self._get_validated_session_for_agent(agent_id)
+
+        from memanto.app.services.memory_policy_service import MemoryPolicy
+
+        parsed = MemoryPolicy(**policy)
+        path = self._get_policy_service().save_policy(agent_id, parsed)
+        return {
+            "agent_id": agent_id,
+            "policy": parsed.model_dump(mode="json", exclude_none=True),
+            "path": str(path),
+        }
+
+    def list_policy_presets(self) -> list[dict[str, Any]]:
+        """List the predefined policy bundles."""
+        from memanto.app.services.policy_presets import list_presets
+
+        return list_presets()
+
+    def get_policy_preset(self, name: str) -> dict[str, Any]:
+        """Return one preset's full policy without adopting it.
+
+        Lets a caller show exactly what a preset contains before committing
+        to it, which is what makes an informed confirmation possible.
+        """
+        from memanto.app.services.policy_presets import PRESETS, load_preset
+
+        policy = load_preset(name)
+        return {
+            "name": name,
+            "description": PRESETS[name]["description"],
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+        }
+
+    def apply_policy_preset(self, agent_id: str, name: str) -> dict[str, Any]:
+        """Adopt a predefined policy bundle as the agent's policy."""
+        self._get_validated_session_for_agent(agent_id)
+
+        from memanto.app.services.policy_presets import load_preset
+
+        policy = load_preset(name)
+        self._get_policy_service().save_policy(agent_id, policy)
+        return {
+            "agent_id": agent_id,
+            "preset": name,
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+        }
+
+    def apply_policy(self, agent_id: str, dry_run: bool = False) -> dict[str, Any]:
+        """Sweep the agent's memories, expiring everything the policy matches."""
+        self._get_validated_session_for_agent(agent_id)
+        return self._get_policy_service().apply_policies(agent_id, dry_run=dry_run)
+
+    def purge_expired(self, agent_id: str, dry_run: bool = False) -> dict[str, Any]:
+        """Permanently delete memories expired past the policy's purge window."""
+        self._get_validated_session_for_agent(agent_id)
+        return self._get_policy_service().purge_expired(agent_id, dry_run=dry_run)
 
     def upload_file(self, agent_id: str, file_path: str) -> dict[str, Any]:
         """
@@ -719,14 +1071,17 @@ class SdkClient:
             namespace_name=namespace,
             file_path=path,
         )
+        file_size = result.get("fileSize")
+        if file_size is None:
+            file_size = result.get("file_size", 0)
 
         return {
             "agent_id": agent_id,
             "namespace": namespace,
             "success": result.get("success", False),
             "message": result.get("message", ""),
-            "file_name": result.get("fileName", path.name),
-            "file_size": result.get("fileSize", 0),
+            "file_name": result.get("fileName") or result.get("file_name", path.name),
+            "file_size": file_size,
         }
 
     def recall(
@@ -739,6 +1094,8 @@ class SdkClient:
         min_similarity: float | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
+        min_confidence: float | None = None,
+        status: str = "all",
     ) -> dict[str, Any]:
         """
         Search memories by semantic similarity.
@@ -752,6 +1109,9 @@ class SdkClient:
             min_similarity: Minimum similarity threshold.
             created_after: Only memories created after this datetime.
             created_before: Only memories created before this datetime.
+            min_confidence: Minimum confidence threshold.
+            status: Lifecycle filter — ``all`` (default), ``active`` or
+                ``expired``. The default returns both so callers can label them.
 
         Returns:
             Dict with ``agent_id``, ``query``, ``memories``, ``count``.
@@ -772,13 +1132,14 @@ class SdkClient:
         )
         result = self._get_read_service().search_memories(
             query=query,
-            scope_type="agent",
-            scope_id=agent_id,
+            agent_id=agent_id,
             type=type,
             tags=tags,
+            min_confidence=min_confidence,
             min_similarity_score=min_similarity,
             created_after=created_after.isoformat() if created_after else None,
             created_before=created_before.isoformat() if created_before else None,
+            status=status,
             limit=limit,
         )
 
@@ -795,6 +1156,7 @@ class SdkClient:
         as_of: str,
         limit: int | None = None,
         type: list[str] | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Point-in-time recall: what memories existed at a given moment?
@@ -804,12 +1166,14 @@ class SdkClient:
             as_of: ISO-8601 date/datetime string.
             limit: Max results (defaults to config).
             type: Optional type filter.
+            tags: Optional tag filter.
 
         Returns:
             Dict with ``memories`` and ``count``.
         """
         if limit is None:
             limit = ConfigManager().get_recall_config()["limit"]
+        validate_recall_limit(limit)
 
         # Ensure there is a valid, non-expired session for this agent
         self._get_validated_session_for_agent(agent_id)
@@ -818,6 +1182,7 @@ class SdkClient:
             as_of_date=as_of,
             agent_id=agent_id,
             type=type,
+            tags=tags,
             limit=limit,
         )
 
@@ -834,6 +1199,8 @@ class SdkClient:
         since: str,
         limit: int | None = None,
         type: list[str] | None = None,
+        tags: list[str] | None = None,
+        status: str = "all",
     ) -> dict[str, Any]:
         """
         Differential retrieval: what changed since a given date?
@@ -843,12 +1210,14 @@ class SdkClient:
             since: ISO-8601 date/datetime string.
             limit: Max results (defaults to config).
             type: Optional type filter.
+            tags: Optional tag filter.
 
         Returns:
             Dict with ``memories`` and ``count``.
         """
         if limit is None:
             limit = ConfigManager().get_recall_config()["limit"]
+        validate_recall_limit(limit)
 
         # Ensure there is a valid, non-expired session for this agent
         self._get_validated_session_for_agent(agent_id)
@@ -857,6 +1226,8 @@ class SdkClient:
             since_date=since,
             agent_id=agent_id,
             type=type,
+            tags=tags,
+            status=status,
             limit=limit,
         )
 
@@ -872,6 +1243,8 @@ class SdkClient:
         agent_id: str,
         limit: int | None = None,
         type: list[str] | None = None,
+        tags: list[str] | None = None,
+        status: str = "all",
     ) -> dict[str, Any]:
         """
         Recall the most recently stored memories (newest first).
@@ -880,12 +1253,15 @@ class SdkClient:
             agent_id: Target agent.
             limit: Max results (defaults to config).
             type: Optional type filter.
+            tags: Optional tag filter.
+            status: Lifecycle filter — ``all`` (default), ``active`` or ``expired``.
 
         Returns:
             Dict with ``memories`` and ``count``.
         """
         if limit is None:
             limit = ConfigManager().get_recall_config()["limit"]
+        validate_recall_limit(limit)
 
         # Ensure there is a valid, non-expired session for this agent
         self._get_validated_session_for_agent(agent_id)
@@ -893,6 +1269,8 @@ class SdkClient:
         result = self._get_read_service().search_recent(
             agent_id=agent_id,
             type=type,
+            tags=tags,
+            status=status,
             limit=limit,
         )
 
@@ -988,6 +1366,11 @@ class SdkClient:
             footer_prompt=footer_prompt,
         )
 
+        # The RAG path calls Moorcheh directly rather than going through
+        # MemoryReadService, so it needs its own activity entry - otherwise
+        # `answer` is the one memory operation that leaves no trace.
+        log_memory_activity(op="answer", agent_id=agent_id)
+
         return {
             "agent_id": agent_id,
             "question": question,
@@ -1042,7 +1425,9 @@ class SdkClient:
             "export": export_result,
         }
 
-    def generate_conflict_report(self, agent_id: str, date: str) -> dict[str, Any]:
+    def generate_conflict_report(
+        self, agent_id: str, date: str, on_progress=None, cancel_event=None
+    ) -> dict[str, Any]:
         """
         Generate the conflict report for an agent/date.
 
@@ -1066,7 +1451,9 @@ class SdkClient:
         )
 
         service = self._get_daily_analysis_service()
-        conflict_result = service.generate_conflict_report(agent_id, date)
+        conflict_result = service.generate_conflict_report(
+            agent_id, date, on_progress=on_progress, cancel_event=cancel_event
+        )
         return {"conflicts": conflict_result}
 
     # Conflict Resolution
@@ -1082,14 +1469,15 @@ class SdkClient:
             date: Date string (YYYY-MM-DD). Defaults to today.
 
         Returns:
-            List of unresolved conflict dicts.
+            List of unresolved conflict dicts, each with a stable ``index``
+            into the full conflict report.
         """
         if not date:
-            date = datetime.now().strftime("%Y-%m-%d")
+            date = utc_date_str()
 
-        json_path = (
-            Path.home() / ".memanto" / "conflicts" / f"{agent_id}_{date}_conflicts.json"
-        )
+        from memanto.app.config import get_conflict_report_path
+
+        json_path = get_conflict_report_path(agent_id, date)
 
         if not json_path.exists():
             return []
@@ -1097,8 +1485,12 @@ class SdkClient:
         with open(json_path, encoding="utf-8") as f:
             all_conflicts = json.load(f)
 
-        # Return only unresolved conflicts
-        return [c for c in all_conflicts if not c.get("resolved", False)]
+        # Keep unresolved conflicts but preserve each full-report index.
+        return [
+            {**c, "index": idx}
+            for idx, c in enumerate(all_conflicts)
+            if not c.get("resolved", False)
+        ]
 
     def resolve_conflict(
         self,
@@ -1115,24 +1507,36 @@ class SdkClient:
         Args:
             agent_id: Target agent.
             date: Date string (YYYY-MM-DD).
-            conflict_index: 0-based index into the full conflicts list.
-            action: Resolution action — ``keep_old``, ``keep_new``,
-                ``keep_both``, ``remove_both``, or ``manual``.
+            conflict_index: Stable 0-based index into the full conflict report
+                (use ``list_conflicts(...)[i]["index"]``).
+            action: Resolution action. ``keep_old`` / ``keep_new`` /
+                ``remove_both`` / ``manual`` delete the losing memory
+                permanently; ``expire_old`` / ``expire_new`` / ``expire_both``
+                retire it reversibly instead. ``keep_both`` is a no-op.
             manual_content: Required when action is ``manual``.
             manual_type: Memory type for manual replacement.
 
         Returns:
             Dict with resolution result.
         """
-        valid_actions = {"keep_old", "keep_new", "keep_both", "remove_both", "manual"}
+        valid_actions = {
+            "keep_old",
+            "keep_new",
+            "keep_both",
+            "remove_both",
+            "expire_old",
+            "expire_new",
+            "expire_both",
+            "manual",
+        }
         if action not in valid_actions:
             raise ValueError(
                 f"Invalid action '{action}'. Must be one of: {', '.join(sorted(valid_actions))}"
             )
 
-        json_path = (
-            Path.home() / ".memanto" / "conflicts" / f"{agent_id}_{date}_conflicts.json"
-        )
+        from memanto.app.config import get_conflict_report_path
+
+        json_path = get_conflict_report_path(agent_id, date)
         if not json_path.exists():
             raise ValueError(f"No conflict report found for {agent_id} on {date}")
 
@@ -1145,14 +1549,22 @@ class SdkClient:
             )
 
         conflict = all_conflicts[conflict_index]
+
+        # Guard against stale/desynced conflict indexes.
+        if conflict.get("resolved", False):
+            raise ValueError(
+                f"Conflict at index {conflict_index} is already resolved. "
+                "Re-list conflicts and resolve using the 'index' field returned "
+                "by list_conflicts."
+            )
+
         old_id = conflict.get("old_memory_id")
         new_id = conflict.get("new_memory_id")
 
         # Get namespace for memory operations
-        from memanto.app.core import create_memory_scope
+        from memanto.app.core import agent_namespace
 
-        scope = create_memory_scope("agent", agent_id)
-        namespace = scope.to_namespace()
+        namespace = agent_namespace(agent_id)
 
         write_service = self._get_write_service()
         result_details: dict[str, Any] = {"action": action}
@@ -1175,6 +1587,31 @@ class SdkClient:
 
         elif action == "keep_both":
             result_details["note"] = "Both memories kept as-is"
+
+        elif action in ("expire_old", "expire_new", "expire_both"):
+            # Retire the losing memory instead of destroying it: the content
+            # and its audit trail survive, and the decision is reversible via
+            # `memanto memory restore`.
+            targets = {
+                "expire_old": [(old_id, "old")],
+                "expire_new": [(new_id, "new")],
+                "expire_both": [(old_id, "old"), (new_id, "new")],
+            }[action]
+            for mem_id, label in targets:
+                if not mem_id:
+                    continue
+                try:
+                    write_service.set_lifecycle(
+                        mem_id,
+                        namespace,
+                        expired=True,
+                        reason="conflict-resolution",
+                    )
+                    result_details[f"expired_{label}"] = mem_id
+                except Exception as e:
+                    result_details[f"warning_{label}"] = (
+                        f"Could not expire {label} memory: {e}"
+                    )
 
         elif action == "remove_both":
             for mem_id, label in [(old_id, "old"), (new_id, "new")]:
@@ -1221,8 +1658,7 @@ class SdkClient:
                 type=resolved_type,
                 title=title,
                 content=manual_content,
-                scope_type="agent",
-                scope_id=agent_id,
+                agent_id=agent_id,
                 actor_id=agent_id,
                 confidence=0.9,
                 tags=["conflict-resolution"],
@@ -1260,24 +1696,12 @@ class SdkClient:
         Returns:
             Dict with ``output_path``, ``total_memories``, ``per_type_counts``.
         """
+        self._validate_export_limit(limit_per_type)
+
         # Ensure there is a valid, non-expired session for this agent
         self._get_validated_session_for_agent(agent_id)
 
-        from memanto.app.services.memory_export_service import MEMORY_TYPE_ORDER
-
-        memories_by_type: dict[str, list] = {}
-
-        for mem_type in MEMORY_TYPE_ORDER:
-            try:
-                result = self.recall(
-                    agent_id=agent_id,
-                    query="*",
-                    limit=limit_per_type,
-                    type=[mem_type],
-                )
-                memories_by_type[mem_type] = result.get("memories", [])
-            except Exception:
-                memories_by_type[mem_type] = []
+        memories_by_type = self._gather_memories_by_type(agent_id, limit_per_type)
 
         export_svc = self._get_export_service()
         out = output_path if output_path else None
@@ -1305,37 +1729,175 @@ class SdkClient:
         """
         Sync agent memories to a project directory's MEMORY.md.
 
+        Always runs a fresh export first, so memories written earlier in the
+        same session are included. Falls back to the previous cached export
+        when the backend is unreachable, rather than leaving the project's
+        MEMORY.md untouched or wiping it.
+
         Args:
             agent_id: Target agent.
             project_dir: Path to the project directory.
-            limit_per_type: Max memories per type for fresh export (default 25).
+            limit_per_type: Max memories per type for the export (default 25).
 
         Returns:
-            Dict with ``output_path``, ``total_memories``, ``source``.
+            Dict with ``output_path``, ``total_memories``, ``source``
+            (``"fresh"``, or ``"stale-cache"`` if the refresh failed and a
+            previous export was reused instead).
         """
-        # Run export function first (ensures ~/.memanto/exports/... is fresh)
-        self.export_memory_md(agent_id=agent_id, limit_per_type=limit_per_type)
-
-        # Perform sync from cache to project
-        cache_path = Path.home() / ".memanto" / "exports" / f"{agent_id}_memory.md"
+        validate_safe_id(agent_id, "agent_id")
+        cache_path = get_data_dir() / "exports" / f"{agent_id}_memory.md"
         target_path = Path(project_dir) / "MEMORY.md"
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if cache_path.exists():
-            # Copy freshly updated cache to project
-            shutil.copy2(str(cache_path), str(target_path))
+        try:
+            export_result = self.export_memory_md(
+                agent_id=agent_id, limit_per_type=limit_per_type
+            )
+        except ConnectionError:
+            if not cache_path.exists():
+                raise
+            # Backend unreachable, but we have a previously good export —
+            # serve that instead of wiping the project's MEMORY.md.
             content = cache_path.read_text(encoding="utf-8")
-            mem_count = content.count("### ")
+            # Replace the project entry atomically so a repository-controlled
+            # MEMORY.md symlink cannot redirect this write outside the project.
+            atomic_write_text(target_path, content)
             return {
                 "output_path": str(target_path.resolve()),
-                "total_memories": mem_count,
-                "source": "cache",
+                "total_memories": content.count("### "),
+                "source": "stale-cache",
             }
+
+        exported_path = Path(export_result["output_path"])
+        if exported_path.exists():
+            atomic_write_text(target_path, exported_path.read_text(encoding="utf-8"))
 
         return {
             "output_path": str(target_path.resolve()),
-            "total_memories": 0,
+            "total_memories": export_result.get("total_memories", 0),
             "source": "fresh",
+        }
+
+    def _gather_memories_by_type(
+        self, agent_id: str, limit_per_type: int
+    ) -> dict[str, list]:
+        """Recall memories for every type, grouped by type.
+
+        Raises ``ConnectionError`` when any type recall fails so callers don't
+        overwrite a good export with an incomplete snapshot.
+        """
+        from memanto.app.services.memory_export_service import MEMORY_TYPE_ORDER
+
+        memories_by_type: dict[str, list] = {}
+        failed_types: list[str] = []
+
+        for mem_type in MEMORY_TYPE_ORDER:
+            try:
+                result = self.recall(
+                    agent_id=agent_id,
+                    query="*",
+                    limit=limit_per_type,
+                    type=[mem_type],
+                )
+                memories_by_type[mem_type] = result.get("memories", [])
+            except Exception:
+                memories_by_type[mem_type] = []
+                failed_types.append(mem_type)
+
+        if failed_types:
+            if len(failed_types) == len(MEMORY_TYPE_ORDER):
+                detail = "the backend appears unreachable"
+            else:
+                detail = f"failed types: {', '.join(failed_types)}"
+            raise ConnectionError(
+                f"Failed to recall a complete memory set for agent '{agent_id}' — "
+                f"{detail}. Refusing to write an incomplete export."
+            )
+        return memories_by_type
+
+    def export_okf_bundle(
+        self,
+        agent_id: str,
+        output_dir: str | None = None,
+        split: str = "auto",
+        limit_per_type: int = 25,
+    ) -> dict[str, Any]:
+        """Export all memories for an agent as an OKF bundle directory.
+
+        Args:
+            agent_id: Target agent.
+            output_dir: Bundle directory. Defaults to
+                ``~/.memanto/exports/{agent_id}_okf``.
+            split: OKF layout — ``auto``, ``file``, or ``type``.
+            limit_per_type: Max memories per type (default 25).
+
+        Returns:
+            Dict with ``output_path``, ``total_memories``, ``per_type_counts``.
+        """
+        self._get_validated_session_for_agent(agent_id)
+
+        from memanto.app.config import get_data_dir
+        from memanto.app.services.okf_export_service import OkfExportService
+
+        memories_by_type = self._gather_memories_by_type(agent_id, limit_per_type)
+
+        data_dir = get_data_dir()
+        summaries = sorted((data_dir / "summaries").glob(f"{agent_id}_*.md"))
+        sessions = sorted((data_dir / "sessions").glob(f"{agent_id}_*_summary.md"))
+
+        return OkfExportService().write_okf_bundle(
+            agent_id=agent_id,
+            memories_by_type=memories_by_type,
+            output_dir=Path(output_dir) if output_dir else None,
+            split=split,
+            summaries=summaries,
+            sessions=sessions,
+        )
+
+    def sync_okf_to_project(
+        self,
+        agent_id: str,
+        project_dir: str,
+        split: str = "auto",
+        limit_per_type: int = 25,
+    ) -> dict[str, Any]:
+        """Sync agent memories to a project directory as an OKF bundle (``<project>/okf``).
+
+        Runs a fresh export into the cache, then copies the bundle into the
+        project. Falls back to the previous cached bundle when the backend is
+        unreachable (``source="stale-cache"``).
+        """
+        target = Path(project_dir) / "okf"
+        cache = Path.home() / ".memanto" / "exports" / f"{agent_id}_okf"
+
+        try:
+            result = self.export_okf_bundle(
+                agent_id=agent_id, split=split, limit_per_type=limit_per_type
+            )
+            src = Path(result["output_path"])
+            total = result["total_memories"]
+            source = "fresh"
+        except ConnectionError:
+            if not cache.exists():
+                raise
+            from memanto.cli.migrate.okf_loader import load_okf_bundle
+
+            src = cache
+            total = len(load_okf_bundle(cache)["memories"])
+            source = "stale-cache"
+
+        tmp = target.with_suffix(".okf.tmp")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        shutil.copytree(src, tmp)
+        if target.exists():
+            shutil.rmtree(target)
+        tmp.rename(target)
+
+        return {
+            "output_path": str(target.resolve()),
+            "total_memories": total,
+            "source": source,
         }
 
     # Health Check
@@ -1385,5 +1947,14 @@ class SdkClient:
         """Validate search parameters."""
         if not query or not query.strip():
             raise ValueError("Search query must be a non-empty string")
-        if not 1 <= limit <= 100:
-            raise ValueError(f"Limit must be between 1 and 100, got {limit}")
+        validate_recall_limit(limit)
+
+    @staticmethod
+    def _validate_export_limit(limit_per_type: int) -> None:
+        """Validate per-type export limits before querying every memory type."""
+        if not isinstance(limit_per_type, int) or isinstance(limit_per_type, bool):
+            raise ValueError("limit_per_type must be an integer between 1 and 100")
+        if not 1 <= limit_per_type <= 100:
+            raise ValueError(
+                f"limit_per_type must be between 1 and 100, got {limit_per_type}"
+            )

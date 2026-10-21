@@ -24,7 +24,9 @@ _DEFAULT_URL = "http://localhost:8080"
 def _import_raw_client() -> Any:
     """Lazy import so the cloud path doesn't require ``moorcheh-client``."""
     try:
-        from moorcheh import MoorchehClient  # type: ignore[import-not-found]
+        from moorcheh import (
+            MoorchehClient,  # type: ignore[import-not-found,import-untyped]
+        )
     except ImportError as e:  # pragma: no cover - exercised at runtime only
         raise RuntimeError(
             "moorcheh-client is not installed. Run: pip install moorcheh-client"
@@ -33,17 +35,28 @@ def _import_raw_client() -> Any:
 
 
 def _import_docker_runtime_helpers() -> tuple[Any, Any]:
-    """Lazy import of upload-dir helpers; only needed for ``upload_file``."""
+    """Lazy import of upload-dir helpers; only needed for ``upload_file``.
+
+    moorcheh-client ships these helpers in ``moorcheh.cli.docker_runtime``.
+    The flat ``moorcheh.docker_runtime`` path is tried second so older
+    layouts keep working.
+    """
     try:
-        from moorcheh.docker_runtime import (  # type: ignore[import-not-found]
+        from moorcheh.cli.docker_runtime import (  # type: ignore[import-not-found,import-untyped]
             ensure_upload_dir,
             host_path_to_container_upload_path,
         )
-    except ImportError as e:  # pragma: no cover - exercised at runtime only
-        raise RuntimeError(
-            "moorcheh.docker_runtime helpers are unavailable. "
-            "Upgrade with: pip install -U moorcheh-client"
-        ) from e
+    except ImportError:
+        try:
+            from moorcheh.docker_runtime import (  # type: ignore[import-not-found,import-untyped]
+                ensure_upload_dir,
+                host_path_to_container_upload_path,
+            )
+        except ImportError as e:  # pragma: no cover - exercised at runtime only
+            raise RuntimeError(
+                "moorcheh docker runtime helpers are unavailable. "
+                "Upgrade with: pip install -U moorcheh-client"
+            ) from e
     return ensure_upload_dir, host_path_to_container_upload_path
 
 
@@ -77,6 +90,7 @@ class _DocumentsAdapter:
         job was accepted, not that indexing has completed.
         """
         import shutil
+        import uuid
 
         ensure_upload_dir, host_path_to_container_upload_path = (
             _import_docker_runtime_helpers()
@@ -87,9 +101,9 @@ class _DocumentsAdapter:
             raise FileNotFoundError(f"upload_file: not a file: {src}")
 
         upload_root = ensure_upload_dir()
-        host_file = (upload_root / src.name).resolve()
-        if host_file != src:
-            shutil.copy2(src, host_file)
+        staged_name = f"{src.stem}-{uuid.uuid4().hex}{src.suffix}"
+        host_file = (upload_root / staged_name).resolve()
+        shutil.copy2(src, host_file)
         container_path = host_path_to_container_upload_path(host_file, upload_root)
 
         resp = self._raw.files.upload(
