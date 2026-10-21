@@ -1,15 +1,27 @@
 import sys
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
+import pytest
 
-mock_ollama_setup = Mock()
-sys.modules["moorcheh"] = Mock()
-sys.modules["moorcheh.ollama_setup"] = mock_ollama_setup
+from memanto.cli.commands import core
 
-from memanto.cli.commands import core  # noqa: E402
+@pytest.fixture
+def mock_ollama_setup():
+    mock_pkg = Mock()
+    mock_setup = Mock()
+    mock_pkg.ollama_setup = mock_setup
+    
+    with patch.dict(
+        "sys.modules",
+        {
+            "moorcheh": mock_pkg,
+            "moorcheh.ollama_setup": mock_setup,
+        },
+    ):
+        yield mock_setup
 
 
 def test_pull_ollama_model_uses_host_http_when_native_ollama_is_reachable(
-    monkeypatch,
+    monkeypatch, mock_ollama_setup
 ):
     http_pull = Mock()
     container_pull = Mock()
@@ -24,7 +36,7 @@ def test_pull_ollama_model_uses_host_http_when_native_ollama_is_reachable(
 
 
 def test_pull_ollama_model_falls_back_to_container_when_host_is_unreachable(
-    monkeypatch,
+    monkeypatch, mock_ollama_setup
 ):
     http_pull = Mock()
     container_pull = Mock()
@@ -38,7 +50,7 @@ def test_pull_ollama_model_falls_back_to_container_when_host_is_unreachable(
     container_pull.assert_called_once_with("nomic-embed-text")
 
 
-def test_onprem_setup_routes_ollama_models_through_shared_pull_helper(monkeypatch):
+def test_onprem_setup_routes_ollama_models_through_shared_pull_helper(monkeypatch, mock_ollama_setup):
     state = {
         "embedding_provider": "ollama",
         "embedding_model": "nomic-embed-text",
