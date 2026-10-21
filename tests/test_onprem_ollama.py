@@ -1,6 +1,9 @@
+import sys
 from unittest.mock import Mock, call
 
-from moorcheh import ollama_setup
+mock_ollama_setup = Mock()
+sys.modules["moorcheh"] = Mock()
+sys.modules["moorcheh.ollama_setup"] = mock_ollama_setup
 
 from memanto.cli.commands import core
 
@@ -10,8 +13,8 @@ def test_pull_ollama_model_uses_host_http_when_native_ollama_is_reachable(
 ):
     http_pull = Mock()
     container_pull = Mock()
-    monkeypatch.setattr(ollama_setup, "ollama_is_reachable", lambda: True)
-    monkeypatch.setattr(ollama_setup, "pull_ollama_model_http", http_pull)
+    monkeypatch.setattr(mock_ollama_setup, "ollama_is_reachable", lambda: True)
+    monkeypatch.setattr(mock_ollama_setup, "pull_ollama_model_http", http_pull)
     monkeypatch.setattr(core, "_pull_ollama_model_in_container", container_pull)
 
     core._pull_ollama_model("nomic-embed-text")
@@ -25,8 +28,8 @@ def test_pull_ollama_model_falls_back_to_container_when_host_is_unreachable(
 ):
     http_pull = Mock()
     container_pull = Mock()
-    monkeypatch.setattr(ollama_setup, "ollama_is_reachable", lambda: False)
-    monkeypatch.setattr(ollama_setup, "pull_ollama_model_http", http_pull)
+    monkeypatch.setattr(mock_ollama_setup, "ollama_is_reachable", lambda: False)
+    monkeypatch.setattr(mock_ollama_setup, "pull_ollama_model_http", http_pull)
     monkeypatch.setattr(core, "_pull_ollama_model_in_container", container_pull)
 
     core._pull_ollama_model("nomic-embed-text")
