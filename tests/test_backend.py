@@ -206,20 +206,7 @@ class TestOnPremClient:
         """
         import pytest
 
-        # Check if moorcheh is installed
-        try:
-            import moorcheh
-        except ImportError:
-            pytest.skip("moorcheh is not installed")
-
-        # Even if moorcheh is installed, the docker runtime helpers might not be available
-        try:
-            try:
-                from moorcheh.cli.docker_runtime import ensure_upload_dir
-            except ImportError:
-                from moorcheh.docker_runtime import ensure_upload_dir
-        except ImportError:
-            pytest.skip("moorcheh docker runtime helpers are not available in this installation")
+        pytest.importorskip("moorcheh")
 
         from memanto.app.clients import onprem
 
